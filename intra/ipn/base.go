@@ -41,7 +41,7 @@ func (h *base) Dial(network, addr string) (c protect.Conn, err error) {
 		return nil, errProxyStopped
 	}
 
-	if c, err = dialers.SplitDial(h.outbound, network, addr); err != nil {
+	if c, err = dialers.SplitDial3(h.outbound, network, addr); err != nil {
 		h.status = TKO
 	} else {
 		h.status = TOK
