@@ -287,7 +287,7 @@ func (t *piph2) Dial(network, addr string) (protect.Conn, error) {
 	if !strings.HasSuffix(u.Path, "/") {
 		u.Path += "/"
 	}
-	u.Path += domain + "/" + port + "/" + network
+	u.Path += domain + "/" + port + "/" + t.rsasig
 
 	// ref: github.com/ginuerzh/gost/blob/1c62376e0880e/http2.go#L221
 	// and: github.com/golang/go/issues/17227#issuecomment-249424243
@@ -312,7 +312,13 @@ func (t *piph2) Dial(network, addr string) (protect.Conn, error) {
 		closePipe(readable, writable)
 		return nil, err
 	}
-	msg := hexurl(u.Path)
+
+	msg := fixedMsgHex // 16 bytes; fixed
+	if uniqClaimPerUrl {
+		msg = hexurl(u.Path) // 32 bytes; per url
+	} else {
+		u.Path = u.Path + "/" + msg
+	}
 
 	trace := httptrace.ClientTrace{
 		GetConn: func(hostPort string) {

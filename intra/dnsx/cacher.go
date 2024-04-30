@@ -47,6 +47,7 @@ const (
 var (
 	errNoQuestion            = errors.New("no question")
 	errNoAnswer              = errors.New("no answer")
+	errHangover              = errors.New("no connectivity")
 	errCacheResponseEmpty    = errors.New("empty cache response")
 	errCacheResponseMismatch = errors.New("cache response mismatch")
 )
@@ -70,16 +71,17 @@ type cres struct {
 
 // TODO: Keep a context here so that queries can be canceled.
 type ctransport struct {
-	sync.RWMutex               // protects store
-	Transport                  // the underlying transport
-	store        []*cache      // cache buckets
-	ipport       string        // a fake ip:port
-	status       int           // status of this transport
-	ttl          time.Duration // lifetime duration of a cached dns entry
-	halflife     time.Duration // increment ttl on each read
-	bumps        int           // max bumps in lifetime of a cached response
-	size         int           // max size of a cache bucket
-	reqbarrier   *core.Barrier // coalesce requests for the same query
+	sync.RWMutex                      // protects store
+	Transport                         // the underlying transport
+	store        []*cache             // cache buckets
+	ipport       string               // a fake ip:port
+	status       int                  // status of this transport
+	ttl          time.Duration        // lifetime duration of a cached dns entry
+	halflife     time.Duration        // increment ttl on each read
+	bumps        int                  // max bumps in lifetime of a cached response
+	size         int                  // max size of a cache bucket
+	reqbarrier   *core.Barrier[*cres] // coalesce requests for the same query
+	hangover     *core.Hangover       // tracks send failure threshold
 	est          core.P2QuantileEstimator
 }
 
@@ -110,7 +112,8 @@ func NewCachingTransport(t Transport, ttl time.Duration) Transport {
 		halflife:   ttl / 2,
 		bumps:      defbumps,
 		size:       defsize,
-		reqbarrier: core.NewBarrier(ttl10s),
+		reqbarrier: core.NewBarrier[*cres](ttl10s),
+		hangover:   core.NewHangover(),
 		est:        core.NewP50Estimator(),
 	}
 	log.I("cache: (%s) setup: %s; opts: %s", ct.ID(), ct.GetAddr(), ct.str())
@@ -304,13 +307,22 @@ func (t *ctransport) Type() string {
 	return t.Transport.Type()
 }
 
+func (t *ctransport) hangoverCheckpoint() {
+	if t.Status() == SendFailed {
+		t.hangover.Note()
+	} else {
+		t.hangover.Break()
+	}
+}
+
 func (t *ctransport) fetch(network string, q []byte, msg *dns.Msg, summary *x.DNSSummary, cb *cache, key string) (r []byte, err error) {
 	sendRequest := func(fsmm *x.DNSSummary) ([]byte, error) {
 		fsmm.ID = t.Transport.ID()
 		fsmm.Type = t.Transport.Type()
 
-		v, _ := t.reqbarrier.Do(key, func() (any, error) {
-			ans, qerr := t.Transport.Query(network, q, fsmm)
+		v, _ := t.reqbarrier.Do(key, func() (*cres, error) {
+			ans, qerr := Req(t.Transport, network, q, fsmm)
+			t.hangoverCheckpoint()
 			// cb.put no-ops when len(ans) is 0
 			cb.put(key, ans, fsmm)
 			// cres.ans may be nil
@@ -319,20 +331,33 @@ func (t *ctransport) fetch(network string, q []byte, msg *dns.Msg, summary *x.DN
 
 		cachedres, fresh := cb.freshCopy(key) // always prefer value from cache
 		if cachedres == nil {                 // use barrier response
-			var ok bool
-			cachedres, ok = v.Val.(*cres) // never nil, even on errs; but cres.ans may be nil
-			log.D("cache: barrier: empty(%s); %s; typecast? %t", key, cachedres, ok)
+			cachedres = v.Val.copy() // never nil, even on errs; but cres.ans may be nil
+			log.D("cache: barrier: empty(k: %s); barrier: %s", key, v.String())
 		} else if !fresh { // expect fresh values, except on verrs
-			log.W("cache: barrier: stale(%s); barrier: %s (cache: %s)", key, v.String(), cachedres.String())
+			log.W("cache: barrier: stale(k: %s); barrier: %s (cache: %s)", key, v.String(), cachedres.String())
 		}
 
-		if cachedres == nil { // nil iff typecast above fails
-			return nil, errCacheResponseEmpty
+		// if there's no network connectivity (in hangover for 10s) don't
+		// return cached/barriered response, instead return an error
+		if !t.hangover.Within(ttl10s) {
+			log.D("cache: barrier: hangover(k: %s); discard ans", key)
+			err := errors.Join(v.Err, errHangover)
+			// retain upstream
+			fsmm.Server = cachedres.s.Server
+			fsmm.RelayServer = cachedres.s.RelayServer
+			// retain query
+			fsmm.QName = cachedres.s.QName
+			fsmm.QType = cachedres.s.QType
+			// mimic send fail
+			fsmm.Msg = err.Error()
+			fsmm.RCode = dns.RcodeServerFailure
+			fsmm.Status = SendFailed
+			return nil, err
 		}
 
 		fres, cachedsmm, ferr := asResponse(msg, cachedres, true)
 		// fill summary regardless of errors
-		fillSummary(cachedsmm, fsmm) // cachedsmm may be equal to finalsumm
+		fillSummary(cachedsmm, fsmm) // cachedsmm may itself be fsmm
 
 		return fres, errors.Join(v.Err, ferr)
 	}
@@ -342,15 +367,16 @@ func (t *ctransport) fetch(network string, q []byte, msg *dns.Msg, summary *x.DN
 	// no network connectivity but cache returns proper responses to queries,
 	// which results in confused apps that think there's network connectivity,
 	// that is, these confused apps go bezerk resulting in battery drain.
-	tok := t.Status() != SendFailed
+	// has 10s elapsed since the first send failure
+	trok := t.hangover.Within(ttl10s)
 
-	if v, isfresh := cb.freshCopy(key); tok && v != nil {
+	if v, isfresh := cb.freshCopy(key); trok && v != nil {
 		var cachedsummary *x.DNSSummary
 
-		log.D("cache: hit(%s): %s, but stale? %t", key, v.str(), !isfresh)
+		log.D("cache: hit(k: %s / stale? %t): %s", key, !isfresh, v.str())
 		r, cachedsummary, err = asResponse(msg, v, isfresh) // return cached response, may be stale
 		if err != nil {
-			log.W("cache: hit(%s) %s, but err? %v", key, v.str(), err)
+			log.W("cache: hit(k: %s) %s, but err? %v", key, v.str(), err)
 			if err == errCacheResponseMismatch {
 				// FIXME: this is a hack to fix the issue where the cache
 				// returns a response that does not match the query.
@@ -369,6 +395,8 @@ func (t *ctransport) fetch(network string, q []byte, msg *dns.Msg, summary *x.DN
 			t.est.Add(0)        // however, update the estimator
 			return
 		} // else: fallthrough to sendRequest
+	} else {
+		log.D("cache: miss(k: %s): cached? %t, hangover? %t, stale? %t", key, v != nil, !trok, !isfresh)
 	}
 
 	return sendRequest(summary) // summary is filled by underlying transport

@@ -122,10 +122,11 @@ func HasTCFlag(packet []byte) bool {
 }
 
 func QName(msg *dns.Msg) string {
-	if HasAnyQuestion(msg) {
-		return msg.Question[0].Name
+	if msg == nil || !HasAnyQuestion(msg) {
+		return ""
 	}
-	return ""
+	q := msg.Question[0]
+	return q.Name
 }
 
 func AName(ans dns.RR) (string, error) {
@@ -908,7 +909,7 @@ func IsSVCBQType(qtype uint16) bool {
 }
 
 func HasAnyQuestion(msg *dns.Msg) bool {
-	return msg != nil && len(msg.Question) > 0
+	return !(msg == nil || len(msg.Question) <= 0)
 }
 
 // whether the given msg (ans/query) has a AAAA question section
@@ -1156,6 +1157,17 @@ func AQuadAUnspecified(msg *dns.Msg) bool {
 		}
 	}
 	return false
+}
+
+func IsServFailOrInvalid(q []byte) bool {
+	if len(q) <= 0 {
+		return true // invalid
+	}
+	msg := new(dns.Msg)
+	if err := msg.Unpack(q); err != nil {
+		return true // invalid
+	}
+	return msg.Rcode == dns.RcodeServerFailure // servfail
 }
 
 // Servfail returns a SERVFAIL response to the query q.
