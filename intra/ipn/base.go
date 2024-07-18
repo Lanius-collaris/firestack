@@ -16,6 +16,20 @@ import (
 	"github.com/celzero/firestack/intra/settings"
 )
 
+var currentStrategy func(*protect.RDial, string, string) (protect.Conn, error) = dialers.SplitDial3
+const (
+	retrierStrategy int32 = 0
+	desyncStrategy int32 = 1
+)
+func SwitchStrategy(s int32){
+	switch s {
+	case retrierStrategy:
+		currentStrategy = dialers.SplitDial
+	case desyncStrategy:
+		currentStrategy = dialers.SplitDial3
+	}
+}
+
 // base is no-op proxy that dials into the underlying network,
 // which typically is wifi or mobile but may also be a tun device.
 type base struct {
@@ -58,7 +72,7 @@ func (h *base) Dial(network, addr string) (c protect.Conn, err error) {
 	if settings.Loopingback.Load() { // loopback (rinr) mode
 		c, err = dialers.Dial(h.outbound, network, addr)
 	} else {
-		c, err = dialers.SplitDial(h.outbound, network, addr)
+		c, err = currentStrategy(h.outbound, network, addr)
 	}
 
 	log.I("proxy: base: dial(%s) to %s; err? %v", network, addr, err)
