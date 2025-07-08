@@ -7,6 +7,7 @@
 package intra
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -110,6 +111,8 @@ type demuxconn struct {
 	rt  *time.Ticker  // read deadline
 	wto time.Duration // write timeout
 	rto time.Duration // read timeout
+
+	realConn net.Conn
 }
 
 // slice is a byte slice v and its recycler fin.
@@ -201,64 +204,57 @@ func (x *muxer) readers() {
 	// todo: recover must call "recycle()" if it wasn't.
 	defer core.Recover(core.Exit11, "udpmux.read."+x.pid+x.cid)
 	defer func() {
+		now1 := time.Now()
+		for _, conn := range x.routes {
+			conn.realConn.SetReadDeadline(now1)
+			conn.Close()
+		}
 		_ = x.stop() // stop muxer
 	}()
 
-	timeouterrors := 0
-	for {
-		bptr := core.Alloc()
-		b := *bptr
-		b = b[:cap(b)]
-		// todo: if panics are recovered above, recycle() may never be called
-		recycle := func() {
-			*bptr = b
-			core.Recycle(bptr)
-		}
+	bptr := core.AllocRegion(core.B65536)
+	b := *bptr
+	b = b[:cap(b)]
+	// todo: if panics are recovered above, free() may never be called
+	recycle := func() {
+		*bptr = b
+		core.Recycle(bptr)
+	}
+	defer recycle()
 
-		// on muxer.stop(), x.doneCh is also closed and x.mxconn.ReadFrom will error out.
+	var t1 [4]byte
+	oldWho := net.UDPAddr{
+		IP:   t1[:],
+		Port: 0,
+	}
+	var dst *demuxconn = nil
+	for {
+		x.mxconn.SetReadDeadline(time.Now().Add(udptimeout * time.Second))
 		n, who, err := x.mxconn.ReadFrom(b)
 
 		x.stats.tx.Add(uint32(n)) // upload
 
-		if timedout(err) {
-			timeouterrors++
-			if timeouterrors < maxtimeouterrors {
-				// extend by preset (min) udp timeout
-				x.extend(time.Now().Add(time.Second * udptimeout))
-				log.D("udp: mux: %s read timeout(%d): %v", x.cid, timeouterrors, err)
-				recycle()
-				continue
-			}
-		}
 		if err != nil {
 			log.I("udp: mux: %s read done n(%d): %v", x.cid, n, err)
-			recycle()
 			return
 		}
 
-		timeouterrors = 0 // reset on successful reads
-
 		if who == nil || n == 0 {
 			log.W("udp: mux: %s read done n(%d): nil remote addr; skip", x.cid, n)
-			recycle()
 			continue
 		}
 
-		const todoCid = "todo"
-		// may be an existing route or a new route;
-		// recycle() if who is invalid or x is closed.
-		if dst := x.route(todoCid, addr2netip(who), ingress); dst != nil {
-			select {
-			case dst.inCh <- &slice{v: b[:n], fin: recycle}: // incomingCh is never closed
-			default: // dst probably closed, but not yet unrouted
-				err = errUdpIncomingDrop
-				recycle()
+		who2 := who.(*net.UDPAddr)
+		if !bytes.Equal(oldWho.IP, who2.IP) || oldWho.Port != who2.Port {
+			oldWho = *who2
+			dst = x.findRoute(addr2netip(who))
+		}
+		if dst != nil {
+			_, err = dst.realConn.Write(b[:n])
+			if err != nil {
+				return
 			}
-			logev(err)("udp: mux: %s read: n(%d) from %v <= %v; dropped? %v",
-				dst.cid, n, dst.laddr, who, err)
-		} else { // dst may be nil when x.doneCh is closed by muxer.stop().
-			recycle()
-		} // looping back is okay, as x.mxconn.ReadFrom should error out.
+		}
 	}
 }
 
@@ -268,7 +264,7 @@ func (x *muxer) findRoute(to netip.AddrPort) *demuxconn {
 	return x.routes[to]
 }
 
-func (x *muxer) route(cid string, to netip.AddrPort, flo flowkind) *demuxconn {
+func (x *muxer) route(cid string, to netip.AddrPort, flo flowkind, gconn net.Conn) *demuxconn {
 	if !to.IsValid() {
 		log.W("udp: mux: %s route: %s invalid addr %s", cid, flo, to)
 		return nil
@@ -286,7 +282,7 @@ func (x *muxer) route(cid string, to netip.AddrPort, flo flowkind) *demuxconn {
 		// new routes created here won't really exist in netstack if
 		// settings.EndpointIndependentMapping or settings.EndpointIndependentFiltering
 		// is set to false.
-		conn = x.newLocked(cid, to)
+		conn = x.newLocked(cid, to, gconn)
 		select {
 		case <-x.doneCh:
 			clos(conn)
@@ -345,7 +341,7 @@ func (x *muxer) extend(t time.Time) {
 }
 
 // new creates a demuxed conn to r.
-func (x *muxer) newLocked(cid string, r netip.AddrPort) *demuxconn {
+func (x *muxer) newLocked(cid string, r netip.AddrPort, gconn net.Conn) *demuxconn {
 	dopt := settings.GetDialerOpts() // TODO: update timeouts when opts change
 	readtimeout := time.Second * time.Duration(max(udptimeout, dopt.ReadTimeoutSec))
 	writetimeout := time.Second * time.Duration(max(udptimeout, dopt.WriteTimeoutSec))
@@ -366,6 +362,7 @@ func (x *muxer) newLocked(cid string, r netip.AddrPort) *demuxconn {
 		rt:         time.NewTicker(readtimeout),
 		wto:        writetimeout,
 		rto:        readtimeout,
+		realConn:   gconn,
 	}
 }
 
@@ -391,23 +388,11 @@ func (c *demuxconn) Read(p []byte) (int, error) {
 
 // Write implements core.UDPConn.Write
 func (c *demuxconn) Write(p []byte) (n int, err error) {
-	defer c.wt.Reset(c.wto)
 	sz := len(p)
-	select {
-	case <-c.wt.C:
-		log.W("udp: mux: %s demux: write: %v => %v; timeout (sz: %d)",
-			c.out.id(), c.laddr, c.raddr, sz)
-		return 0, os.ErrDeadlineExceeded
-	case <-c.closed:
-		log.W("udp: mux: %s demux: write: %v => %v; closed (sz: %d)",
-			c.out.id(), c.laddr, c.raddr, sz)
-		return 0, net.ErrClosed
-	default:
-		n, err = c.out.sendto(p, c.raddr)
-		logev(err)("udp: mux: %s demux: write: %v => %v; done(sz: %d/%d); err? %v",
-			c.out.id(), c.laddr, c.raddr, n, sz, err)
-		return n, err
-	}
+	n, err = c.out.sendto(p, c.raddr)
+	logev(err)("udp: mux: %s demux: write: %v => %v; done(sz: %d/%d); err? %v",
+		c.out.id(), c.laddr, c.raddr, n, sz, err)
+	return n, err
 }
 
 // ReadFrom implements core.UDPConn.ReadFrom (unused)
@@ -544,7 +529,7 @@ func (e *muxTable) pid(src netip.AddrPort) string {
 	return ""
 }
 
-func (e *muxTable) associate(cid, pid, uid string, src, dst netip.AddrPort, mk assocFn, v vendor) (_ net.Conn, err error) {
+func (e *muxTable) associate(cid, pid, uid string, src, dst netip.AddrPort, mk assocFn, v vendor, gconn net.Conn) (_ net.Conn, err error) {
 	e.Lock() // lock
 
 	pxm := e.t[pid]
@@ -599,7 +584,7 @@ func (e *muxTable) associate(cid, pid, uid string, src, dst netip.AddrPort, mk a
 
 	e.Unlock() // unlock
 	// do not hold e.lock on calls into mxr
-	c := mxr.route(cid, dst, egress)
+	c := mxr.route(cid, dst, egress, gconn)
 	if c == nil {
 		log.E("udp: mux: %s vend: no conn for %s", cid, dst)
 		return nil, errUdpSetupConn

@@ -169,7 +169,25 @@ func (h *udpHandler) proxy(gconn *netstack.GUDPConn, src, dst netip.AddrPort, dm
 
 	cid := smm.ID
 	core.Go("udp.forward."+cid, func() {
-		h.forward(gconn, rwext{remote, udptimeout}, smm)
+		if dmx == nil {
+			h.forward(gconn, rwext{remote, udptimeout}, smm)
+		} else {
+			remoteInner := remote.(*demuxconn).out.(*muxer).mxconn
+			dst2 := net.UDPAddrFromAddrPort(dst)
+			defer gconn.Close()
+			var buf [65536]byte
+			for {
+				gconn.SetReadDeadline(time.Now().Add(udptimeout * time.Second))
+				n, err := gconn.Read(buf[:])
+				if err != nil {
+					break
+				}
+				_, err = remoteInner.WriteTo(buf[:n], dst2)
+				if err != nil {
+					break
+				}
+			}
+		}
 	})
 	return true // ok
 }
@@ -277,7 +295,7 @@ func (h *udpHandler) Connect(gconn *netstack.GUDPConn, src, target netip.AddrPor
 		pxid = px.ID().V()
 		selectedTarget = dstipp
 		if mux { // mux is not supported by all proxies (few like Exit, Base, WG support it)
-			pc, err = h.mux.associate(cid, pxid, uid, src, selectedTarget, px.Dialer().Announce, vendor(dmx))
+			pc, err = h.mux.associate(cid, pxid, uid, src, selectedTarget, px.Dialer().Announce, vendor(dmx), gconn)
 		} else {
 
 			log.VV("udp: connect: #%d: attempt: %s proxy(%s) to dst(%s) for %s; mux? %t",
