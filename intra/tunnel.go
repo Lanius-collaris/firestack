@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,9 @@ import (
 	"github.com/celzero/firestack/intra/settings"
 	"github.com/celzero/firestack/intra/x64"
 	"github.com/celzero/firestack/tunnel"
+
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const mktunTimeout = 8 * time.Second
@@ -208,6 +212,16 @@ func NewTunnel(fd, mtu int, fakedns string, dtr DefaultDNS, bdg Bridge) (t Tunne
 
 	log.D("tun: <<< new >>>; netstack: ok")
 
+	dnatFn := func(oldAddr tcpip.Address, oldPort uint16) (tcpip.Address, uint16) {
+		if oldAddr.Len() == 16 {
+			t := netip.MustParseAddr("fd66:f83a:c650::1")
+			return tcpip.AddrFrom16(t.As16()), oldPort
+		} else {
+			t := netip.MustParseAddr("10.111.222.1")
+			return tcpip.AddrFrom4(t.As4()), oldPort
+		}
+	}
+	proxies.Hack1(gt.GetStack(), dnatFn)
 	// TODO: err on reverser errors too?
 	rerr := proxies.Reverser(revhdl)
 
@@ -508,4 +522,8 @@ func (t *rtunnel) SetPcap(fpcap string) error {
 func (t *rtunnel) Unlink() error {
 	tunnel := t.t.Load()
 	return tunnel.Unlink()
+}
+
+func (t *rtunnel) GetStack() *stack.Stack {
+	return t.t.Load().GetStack()
 }

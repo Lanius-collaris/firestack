@@ -6,6 +6,11 @@
 
 package backend
 
+import (
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+)
+
 const ( // see ipn/proxies.go
 	// IDs for default proxies
 
@@ -162,6 +167,7 @@ type RpnAcc interface {
 	Update() (newstate *Gobyte, err error)
 }
 
+type DNATFunc func(oldAddr tcpip.Address, oldPort uint16) (tcpip.Address, uint16)
 type Proxies interface {
 	// Underlay creates a [NOOP] proxy (that always connects over underlying network),
 	// but one that uses a custom Controller.
@@ -193,6 +199,8 @@ type Proxies interface {
 	Rpn() Rpn
 	// Refresh re-registers proxies and returns a csv of active ones.
 	RefreshProxies() *Gostr
+
+	Hack1(*stack.Stack, DNATFunc)
 }
 
 type Router interface {

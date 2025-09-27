@@ -27,6 +27,8 @@ import (
 	"github.com/celzero/firestack/intra/netstack"
 	"github.com/celzero/firestack/intra/protect"
 	"github.com/celzero/firestack/intra/settings"
+
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
@@ -258,6 +260,9 @@ type proxifier struct {
 
 	lastSeErr  *core.Volatile[error] // se proxy registration error
 	lastWinErr *core.Volatile[error] // win registration error
+
+	Stack *stack.Stack
+	DNAT  x.DNATFunc
 }
 
 type LinkProps struct {
@@ -1027,6 +1032,11 @@ func (px *proxifier) RefreshProto(l3 string, mtu int, force bool) {
 			}
 		})
 	}
+}
+
+func (px *proxifier) Hack1(s *stack.Stack, dnat x.DNATFunc) {
+	px.Stack = s
+	px.DNAT = dnat
 }
 
 func (px *proxifier) Reverser(rhdl netstack.GConnHandler) error {

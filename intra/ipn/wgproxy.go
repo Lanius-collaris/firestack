@@ -45,6 +45,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -53,6 +54,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const (
@@ -657,7 +659,7 @@ func loadIPNets(out *[]netip.Prefix, v string) (err error) {
 }
 
 // ref: github.com/WireGuard/wireguard-android/blob/713947e432/tunnel/tools/libwg-go/api-android.go#L76
-func NewWgProxy(id string, ctl protect.Controller, px ProxyProvider, lp LinkProps, cfg string) (*wgproxy, error) {
+func NewWgProxy(id string, ctl protect.Controller, px ProxyProvider, lp LinkProps, cfg string, stack2 *stack.Stack, dnat x.DNATFunc) (*wgproxy, error) {
 	ogcfg := cfg
 	opts, err := wgIfConfigOf(id, &cfg)
 	uapicfg := cfg
@@ -671,6 +673,7 @@ func NewWgProxy(id string, ctl protect.Controller, px ProxyProvider, lp LinkProp
 		log.E("proxy: wg: %s failed to create tun %v", id, err)
 		return nil, err
 	}
+	wgtun.ConnectStack(stack2, dnat)
 
 	id = wgtun.id // has stripped prefixes (like FAST), if any
 
@@ -738,6 +741,150 @@ func setupReverserIfNeeded(id string, s *stack.Stack, rev netstack.GConnHandler)
 	log.W("proxy: wg: %s remove rev %X", id, rev)
 	netstack.OutboundTCP(id, s, nil) // unset
 	netstack.OutboundUDP(id, s, nil) // unset
+}
+
+type TCPLike interface {
+	net.Conn
+	CloseRead() error
+	CloseWrite() error
+}
+
+func forwardTCP1(input TCPLike, output TCPLike) {
+	defer func() {
+		output.CloseWrite()
+		input.CloseRead()
+	}()
+
+	var buf [65536]byte
+	for {
+		n, err := input.Read(buf[:])
+		if err != nil {
+			break
+		}
+		_, err = output.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+}
+func forwardConn1(input net.Conn, output net.Conn, timeout time.Duration) {
+	var buf [65536]byte
+	for {
+		input.SetReadDeadline(time.Now().Add(timeout))
+		n, err := input.Read(buf[:])
+		if err != nil {
+			break
+		}
+		_, err = output.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+}
+func (tun *wgtun) ConnectStack(stack2 *stack.Stack, dnat x.DNATFunc) {
+	tcpForwarder := tcp.NewForwarder(tun.stack, 0, 1024, func(req *tcp.ForwarderRequest) {
+		id := req.ID()
+		log.D("tcp.ForwarderRequest.ID() %v", id)
+		var proto tcpip.NetworkProtocolNumber
+		if id.LocalAddress.Len() == 16 {
+			proto = ipv6.ProtocolNumber
+		} else {
+			proto = ipv4.ProtocolNumber
+		}
+		dstAddr, dstPort := dnat(id.LocalAddress, id.LocalPort)
+		dst := tcpip.FullAddress{
+			Addr: dstAddr,
+			Port: dstPort,
+		}
+		src := tcpip.FullAddress{
+			Addr: id.RemoteAddress,
+			Port: id.RemotePort,
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		conn1, err := gonet.DialTCPWithBind(ctx, stack2, src, dst, proto)
+		if err != nil {
+			log.E("gonet.DialTCPWithBind() error: %v", err)
+			if opErr, ok := err.(*net.OpError); ok {
+				t1 := tcpip.ErrConnectionRefused{}
+				if opErr.Err.Error() == t1.String() {
+					req.Complete(true)
+					return
+				}
+			}
+			req.Complete(false)
+			return
+		}
+		defer conn1.Close()
+
+		var wq waiter.Queue
+		ep, gErr := req.CreateEndpoint(&wq)
+		if gErr != nil {
+			req.Complete(false)
+			log.E("req.CreateEndpoint error: %v", gErr)
+			return
+		}
+		req.Complete(false)
+		conn2 := gonet.NewTCPConn(&wq, ep)
+		defer conn2.Close()
+
+		var myWG sync.WaitGroup
+		myWG.Add(1)
+		go func() {
+			defer myWG.Done()
+			forwardTCP1(conn2, conn1)
+		}()
+		forwardTCP1(conn1, conn2)
+		myWG.Wait()
+	})
+	tun.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+
+	udpForwarder := udp.NewForwarder(tun.stack, func(req *udp.ForwarderRequest) bool {
+		id := req.ID()
+		log.D("udp.ForwarderRequest.ID() %v", id)
+		var proto tcpip.NetworkProtocolNumber
+		if id.LocalAddress.Len() == 16 {
+			proto = ipv6.ProtocolNumber
+		} else {
+			proto = ipv4.ProtocolNumber
+		}
+		dstAddr, dstPort := dnat(id.LocalAddress, id.LocalPort)
+		dst := tcpip.FullAddress{
+			Addr: dstAddr,
+			Port: dstPort,
+		}
+		src := tcpip.FullAddress{
+			Addr: id.RemoteAddress,
+			Port: id.RemotePort,
+		}
+
+		var wq waiter.Queue
+		ep, gErr := req.CreateEndpoint(&wq)
+		if gErr != nil {
+			return false
+		}
+		go func() {
+			conn1 := gonet.NewTCPConn(&wq, ep)
+			defer conn1.Close()
+			conn2, err := gonet.DialUDP(stack2, &src, &dst, proto)
+			if err != nil {
+				return
+			}
+			defer conn2.Close()
+
+			var myWG sync.WaitGroup
+			myWG.Add(1)
+			go func() {
+				defer myWG.Done()
+				forwardConn1(conn1, conn2, 120*time.Second)
+			}()
+			forwardConn1(conn2, conn1, 120*time.Second)
+			myWG.Wait()
+		}()
+		return true
+	})
+	tun.stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 }
 
 func (w *wgtun) swapVia(new Proxy) (old Proxy) {

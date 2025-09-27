@@ -61,6 +61,8 @@ type Tunnel interface {
 	SetPcap(fpcap string) error
 	// NIC, IP, TCP, UDP, and ICMP stats.
 	Stat() (*x.NetStat, error)
+
+	GetStack() *stack.Stack
 }
 
 type gtunnel struct {
@@ -337,4 +339,8 @@ func maybeDup(fd int) (int, error) {
 		return newfd, err
 	} // other errors?
 	return 0, os.NewSyscallError("fcntl", err)
+}
+
+func (t *gtunnel) GetStack() *stack.Stack {
+	return t.stack
 }
